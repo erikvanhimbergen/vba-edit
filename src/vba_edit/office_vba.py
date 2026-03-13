@@ -2264,9 +2264,13 @@ class ExcelVBAHandler(OfficeVBAHandler):
                     tmp.Name = _MACRO_MOD
                     tmp.CodeModule.AddFromString(
                         f"Sub {_MACRO_NAME}()\n"
+                        f"    Dim bCheck As Boolean\n"
+                        f"    bCheck = ThisWorkbook.CheckCompatibility\n"
+                        f"    ThisWorkbook.CheckCompatibility = False\n"
                         f"    Application.DisplayAlerts = False\n"
                         f"    ThisWorkbook.Save\n"
                         f"    Application.DisplayAlerts = True\n"
+                        f"    ThisWorkbook.CheckCompatibility = bCheck\n"
                         f"End Sub"
                     )
                     self.app.Run(f"{_MACRO_MOD}.{_MACRO_NAME}")
@@ -2274,14 +2278,15 @@ class ExcelVBAHandler(OfficeVBAHandler):
                     logger.info("Document has been saved and left open for further editing")
                     return
                 except Exception as macro_err:
-                    logger.debug(f"Macro-based save failed ({macro_err}), trying direct Save()")
+                    logger.warning(f"Macro-based save failed ({macro_err}), trying direct Save()")
                     # Clean up temp module if it was added
                     try:
                         components.Remove(components(_MACRO_MOD))
                     except Exception:
                         pass
 
-                # Strategy 2: direct doc.Save() with DisplayAlerts suppressed
+                # Strategy 2: direct doc.Save() with DisplayAlerts and CheckCompatibility suppressed
+                self.doc.CheckCompatibility = False
                 self.doc.Save()
                 logger.info("Document has been saved and left open for further editing")
 
