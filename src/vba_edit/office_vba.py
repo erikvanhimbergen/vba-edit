@@ -2232,11 +2232,14 @@ class ExcelVBAHandler(OfficeVBAHandler):
             raise VBAError(f"Failed to open workbook: {str(e)}") from e
 
     def save_document(self) -> None:
-        """Save the workbook.
+        """Save the workbook using a VBA macro run from within Excel.
 
-        Sets DisplayAlerts=False so Excel does not show modal dialogs during
-        COM-automated saves (would cause error 0x800A03EC / 1004).
-        Raises a clear error when the workbook is read-only.
+        Calling doc.Save() directly from COM can fail with error 1004 due to
+        COM apartment / proxy issues when Excel is in certain UI states.
+        Running a macro via Application.Run executes on Excel's own VBA thread,
+        which bypasses those marshaling problems entirely.
+        Falls back to direct doc.Save() if macro injection fails, and falls back
+        to a manual-save warning if all automatic save attempts fail.
         """
         if self.doc is not None:
             try:
@@ -2246,14 +2249,49 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         "This usually means it was opened as a duplicate because "
                         "it was already locked by another Excel instance."
                     )
+
                 if self.app is not None:
                     self.app.DisplayAlerts = False
+
+                # Strategy 1: inject a temporary VBA module and run Save() from
+                # within Excel's own VBA thread.  This avoids COM-marshaling
+                # issues that cause error 1004 when calling doc.Save() directly.
+                _MACRO_MOD = "_VbaEditAutoSave_"
+                _MACRO_NAME = "__Save__"
+                try:
+                    components = self.doc.VBProject.VBComponents
+                    tmp = components.Add(1)  # 1 = vbext_ct_StdModule
+                    tmp.Name = _MACRO_MOD
+                    tmp.CodeModule.AddFromString(
+                        f"Sub {_MACRO_NAME}()\n    ThisWorkbook.Save\nEnd Sub"
+                    )
+                    self.app.Run(f"{_MACRO_MOD}.{_MACRO_NAME}")
+                    components.Remove(tmp)
+                    logger.info("Document has been saved and left open for further editing")
+                    return
+                except Exception as macro_err:
+                    logger.debug(f"Macro-based save failed ({macro_err}), trying direct Save()")
+                    # Clean up temp module if it was added
+                    try:
+                        components.Remove(components(_MACRO_MOD))
+                    except Exception:
+                        pass
+
+                # Strategy 2: direct doc.Save() with DisplayAlerts suppressed
                 self.doc.Save()
                 logger.info("Document has been saved and left open for further editing")
+
             except VBAError:
                 raise
             except Exception as e:
-                raise VBAError(f"Failed to save document: {str(e)}") from e
+                # Strategy 3: warn the user – the VBA code is already imported
+                # in memory; just needs a manual Ctrl+S
+                logger.warning(
+                    f"\nAutomatic save failed ({e}).\n"
+                    "VBA code has been imported successfully into the workbook.\n"
+                    "[warning]ACTION REQUIRED:[/warning] Please save the workbook "
+                    "manually in Excel (Ctrl+S)."
+                )
             finally:
                 if self.app is not None:
                     self.app.DisplayAlerts = True
