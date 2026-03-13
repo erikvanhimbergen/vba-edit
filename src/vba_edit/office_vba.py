@@ -981,7 +981,15 @@ class OfficeVBAHandler(ABC):
         try:
             if self.app is None:
                 logger.debug(f"Initializing {self.app_name} application")
-                self.app = win32com.client.Dispatch(self.app_progid)
+                try:
+                    # Prefer connecting to an already-running instance so we get
+                    # the same instance the user is working in (avoids read-only
+                    # conflicts when the document is already open there).
+                    self.app = win32com.client.GetActiveObject(self.app_progid)
+                    logger.debug(f"Connected to running {self.app_name} instance")
+                except Exception:
+                    self.app = win32com.client.Dispatch(self.app_progid)
+                    logger.debug(f"Created new {self.app_name} instance")
                 if self.app_name != "Access":
                     self.app.Visible = True
         except Exception as e:
@@ -1079,7 +1087,7 @@ class OfficeVBAHandler(ABC):
                 self.doc.Save()
                 logger.info("Document has been saved and left open for further editing")
             except Exception as e:
-                raise VBAError("Failed to save document") from e
+                raise VBAError(f"Failed to save document: {str(e)}") from e
 
     def close_document(self) -> None:
         """Close the currently open document and application if no other documents are open.
