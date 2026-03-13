@@ -2209,6 +2209,26 @@ class ExcelVBAHandler(OfficeVBAHandler):
         """Get the name of the document module."""
         return "ThisWorkbook"
 
+    def _wait_for_ready(self, timeout: float = 30.0) -> None:
+        """Poll Application.Ready until Excel is idle or timeout expires.
+
+        This is necessary because Workbook_Open (and other event handlers) may
+        still be running after the workbook is obtained via COM.  Attempting to
+        inject VBA modules or run macros while Excel is busy results in
+        'Er is een uitzondering opgetreden' errors (-2146778156).
+        """
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self.app.Ready:
+                    return
+            except Exception:
+                pass
+            logger.debug("Waiting for Excel to become ready...")
+            time.sleep(0.5)
+        logger.debug("Excel ready-wait timed out; proceeding anyway")
+
     def _open_document_impl(self) -> Any:
         """Implementation-specific document opening logic."""
         try:
@@ -2223,11 +2243,14 @@ class ExcelVBAHandler(OfficeVBAHandler):
                 self.app = wb.Application
                 self.app.Visible = True
                 logger.debug("Obtained workbook via GetObject (file already open)")
-                return wb
             except Exception:
                 # File is not open in any instance – open it via the app we initialised.
                 logger.debug(f"Opening workbook via Workbooks.Open: {self.doc_path}")
-                return self.app.Workbooks.Open(str(self.doc_path))
+                wb = self.app.Workbooks.Open(str(self.doc_path))
+            # Wait until Workbook_Open and any other startup events have finished
+            # before we start manipulating VBProject components.
+            self._wait_for_ready()
+            return wb
         except Exception as e:
             raise VBAError(f"Failed to open workbook: {str(e)}") from e
 
@@ -2252,6 +2275,9 @@ class ExcelVBAHandler(OfficeVBAHandler):
 
                 if self.app is not None:
                     self.app.DisplayAlerts = False
+
+                # Wait for Excel to be idle before touching VBProject or running macros.
+                self._wait_for_ready()
 
                 # Strategy 1: inject a temporary VBA module and run Save() from
                 # within Excel's own VBA thread.  This avoids COM-marshaling
