@@ -2263,7 +2263,11 @@ class ExcelVBAHandler(OfficeVBAHandler):
                     tmp = components.Add(1)  # 1 = vbext_ct_StdModule
                     tmp.Name = _MACRO_MOD
                     tmp.CodeModule.AddFromString(
-                        f"Sub {_MACRO_NAME}()\n    ThisWorkbook.Save\nEnd Sub"
+                        f"Sub {_MACRO_NAME}()\n"
+                        f"    Application.DisplayAlerts = False\n"
+                        f"    ThisWorkbook.Save\n"
+                        f"    Application.DisplayAlerts = True\n"
+                        f"End Sub"
                     )
                     self.app.Run(f"{_MACRO_MOD}.{_MACRO_NAME}")
                     components.Remove(tmp)
