@@ -2203,7 +2203,18 @@ class ExcelVBAHandler(OfficeVBAHandler):
 
     def _open_document_impl(self) -> Any:
         """Implementation-specific document opening logic."""
-        return self.app.Workbooks.Open(str(self.doc_path))
+        try:
+            # Check if workbook is already open in the running Excel instance
+            for wb in self.app.Workbooks:
+                if wb.FullName.lower() == str(self.doc_path).lower():
+                    logger.debug("Using already open workbook")
+                    return wb
+
+            # If not found, open it
+            logger.debug(f"Opening workbook: {self.doc_path}")
+            return self.app.Workbooks.Open(str(self.doc_path))
+        except Exception as e:
+            raise VBAError(f"Failed to open workbook: {str(e)}") from e
 
     def _update_document_module(self, name: str, code: str, components: Any) -> None:
         """Update an existing document module for Excel."""
