@@ -2212,31 +2212,46 @@ class ExcelVBAHandler(OfficeVBAHandler):
     def _open_document_impl(self) -> Any:
         """Implementation-specific document opening logic."""
         try:
-            # Check if workbook is already open in the running Excel instance
-            for wb in self.app.Workbooks:
-                if wb.FullName.lower() == str(self.doc_path).lower():
-                    logger.debug("Using already open workbook")
-                    return wb
-
-            # If not found, open it
-            logger.debug(f"Opening workbook: {self.doc_path}")
-            return self.app.Workbooks.Open(str(self.doc_path))
+            try:
+                # win32com.client.GetObject(path) looks up the file in the Windows
+                # Running Object Table. If the workbook is open in *any* Excel instance
+                # it returns the existing, writable Workbook object directly.
+                # This is more reliable than iterating self.app.Workbooks which only
+                # sees the one instance we happen to have connected to.
+                wb = win32com.client.GetObject(str(self.doc_path))
+                # Sync self.app to the instance that actually owns this workbook.
+                self.app = wb.Application
+                self.app.Visible = True
+                logger.debug("Obtained workbook via GetObject (file already open)")
+                return wb
+            except Exception:
+                # File is not open in any instance – open it via the app we initialised.
+                logger.debug(f"Opening workbook via Workbooks.Open: {self.doc_path}")
+                return self.app.Workbooks.Open(str(self.doc_path))
         except Exception as e:
             raise VBAError(f"Failed to open workbook: {str(e)}") from e
 
     def save_document(self) -> None:
         """Save the workbook.
 
-        Suppresses Excel alert dialogs during save to prevent COM automation
-        failures (0x800A03EC) that occur when Excel tries to show a confirmation
-        prompt after VBA project changes.
+        Sets DisplayAlerts=False so Excel does not show modal dialogs during
+        COM-automated saves (would cause error 0x800A03EC / 1004).
+        Raises a clear error when the workbook is read-only.
         """
         if self.doc is not None:
             try:
+                if getattr(self.doc, 'ReadOnly', False):
+                    raise VBAError(
+                        "Cannot save: workbook is read-only. "
+                        "This usually means it was opened as a duplicate because "
+                        "it was already locked by another Excel instance."
+                    )
                 if self.app is not None:
                     self.app.DisplayAlerts = False
                 self.doc.Save()
                 logger.info("Document has been saved and left open for further editing")
+            except VBAError:
+                raise
             except Exception as e:
                 raise VBAError(f"Failed to save document: {str(e)}") from e
             finally:
