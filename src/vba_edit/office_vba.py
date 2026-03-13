@@ -2224,6 +2224,25 @@ class ExcelVBAHandler(OfficeVBAHandler):
         except Exception as e:
             raise VBAError(f"Failed to open workbook: {str(e)}") from e
 
+    def save_document(self) -> None:
+        """Save the workbook.
+
+        Suppresses Excel alert dialogs during save to prevent COM automation
+        failures (0x800A03EC) that occur when Excel tries to show a confirmation
+        prompt after VBA project changes.
+        """
+        if self.doc is not None:
+            try:
+                if self.app is not None:
+                    self.app.DisplayAlerts = False
+                self.doc.Save()
+                logger.info("Document has been saved and left open for further editing")
+            except Exception as e:
+                raise VBAError(f"Failed to save document: {str(e)}") from e
+            finally:
+                if self.app is not None:
+                    self.app.DisplayAlerts = True
+
     def _update_document_module(self, name: str, code: str, components: Any) -> None:
         """Update an existing document module for Excel."""
         try:
