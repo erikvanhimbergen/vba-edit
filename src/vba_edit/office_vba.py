@@ -2304,20 +2304,33 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         "it was already locked by another Excel instance."
                     )
 
-                if self.app is not None:
-                    self.app.DisplayAlerts = False
-
                 # Wait for Excel to be idle before touching VBProject or running macros.
                 self._wait_for_ready()
+
+                if self.app is not None:
+                    self.app.DisplayAlerts = False
 
                 # Strategy 1: inject a temporary VBA module and run Save() from
                 # within Excel's own VBA thread.  This avoids COM-marshaling
                 # issues that cause error 1004 when calling doc.Save() directly.
+                #
+                # The macro self-removes itself from VBProject BEFORE calling Save so
+                # the saved file never contains the temporary module.  Cleanup via
+                # 'tmp' reference in the finally block ensures that even if the macro
+                # never ran (e.g. VBA engine still busy), "Module1" is never left
+                # behind in the workbook.
                 _MACRO_MOD = "_VbaEditAutoSave_"
                 _MACRO_NAME = "__Save__"
+                tmp = None
+                components = None
                 try:
                     components = self.doc.VBProject.VBComponents
-                    tmp = components.Add(1)  # 1 = vbext_ct_StdModule
+                    # Pre-cleanup: remove any leftover module from a previous failed run.
+                    try:
+                        components.Remove(components(_MACRO_MOD))
+                    except Exception:
+                        pass
+                    tmp = components.Add(1)  # vbext_ct_StdModule; initially named "Module1"
                     tmp.Name = _MACRO_MOD
                     tmp.CodeModule.AddFromString(
                         f"Sub {_MACRO_NAME}()\n"
@@ -2325,9 +2338,10 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         f"    bCheck = ThisWorkbook.CheckCompatibility\n"
                         f"    ThisWorkbook.CheckCompatibility = False\n"
                         f"    Application.DisplayAlerts = False\n"
+                        f"    ' Self-remove before saving so the module is never written to disk\n"
+                        f"    ThisWorkbook.VBProject.VBComponents.Remove "
+                        f"ThisWorkbook.VBProject.VBComponents(\"{_MACRO_MOD}\")\n"
                         f"    ThisWorkbook.Save\n"
-                        f"    Application.DisplayAlerts = True\n"
-                        f"    ThisWorkbook.CheckCompatibility = bCheck\n"
                         f"End Sub"
                     )
                     # After modifying VBProject, wait for Excel to finish recompiling
@@ -2360,16 +2374,19 @@ class ExcelVBAHandler(OfficeVBAHandler):
                             break
                     if last_run_err is not None:
                         raise last_run_err
-                    components.Remove(tmp)
+                    tmp = None  # macro self-removed the module; skip finally cleanup
                     logger.info("Document has been saved and left open for further editing")
                     return
                 except Exception as macro_err:
                     logger.warning(f"Macro-based save failed ({macro_err}), trying direct Save()")
-                    # Clean up temp module if it was added
-                    try:
-                        components.Remove(components(_MACRO_MOD))
-                    except Exception:
-                        pass
+                finally:
+                    # Always clean up by reference so "Module1" never leaks into the
+                    # workbook, regardless of where in strategy 1 an exception occurred.
+                    if tmp is not None and components is not None:
+                        try:
+                            components.Remove(tmp)
+                        except Exception:
+                            pass
 
                 # Strategy 2: direct doc.Save() with DisplayAlerts and CheckCompatibility suppressed
                 self.doc.CheckCompatibility = False
@@ -2390,6 +2407,11 @@ class ExcelVBAHandler(OfficeVBAHandler):
             finally:
                 if self.app is not None:
                     self.app.DisplayAlerts = True
+                try:
+                    if self.doc is not None:
+                        self.doc.CheckCompatibility = True
+                except Exception:
+                    pass
 
     def _update_document_module(self, name: str, code: str, components: Any) -> None:
         """Update an existing document module for Excel."""
