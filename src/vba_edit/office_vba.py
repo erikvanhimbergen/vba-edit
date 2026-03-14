@@ -2209,6 +2209,10 @@ class ExcelVBAHandler(OfficeVBAHandler):
         """Get the name of the document module."""
         return "ThisWorkbook"
 
+    # HRESULT scode returned by Application.Run when the VBA engine is not yet
+    # ready to execute macros (e.g. still compiling after bulk VBProject edits).
+    _SCODE_VBA_BUSY = -2146778156  # 0x800AC3D4
+
     def _wait_for_ready(self, timeout: float = 30.0) -> None:
         """Poll until Excel is idle and no VBA event handlers are running.
 
@@ -2217,9 +2221,12 @@ class ExcelVBAHandler(OfficeVBAHandler):
         2. If the workbook exposes IsVbaRunning() (via A_RUNSTATE module),
            poll that as well.  This catches cases where Application.Ready is
            already True but Workbook_Open (or another event) is still executing.
+           IMPORTANT: distinguish between 'VBA engine busy' (scode 0x800AC3D4,
+           keep waiting) and 'function not found' (any other error, proceed).
         3. Fall through after timeout so the tool is never blocked indefinitely.
         """
         import time
+        import pywintypes
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -2234,10 +2241,20 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         logger.debug("Waiting for VBA event handlers to finish (IsVbaRunning = True)...")
                         time.sleep(0.5)
                         continue
+                except pywintypes.com_error as ce:
+                    # Extract the underlying scode from the EXCEPINFO tuple.
+                    scode = ce.hresult
+                    if ce.excepinfo and ce.excepinfo[5]:
+                        scode = ce.excepinfo[5]
+                    if scode == self._SCODE_VBA_BUSY:
+                        # VBA engine not yet ready for Application.Run – keep waiting.
+                        logger.debug("Waiting: VBA engine not ready for Application.Run (0x800AC3D4)...")
+                        time.sleep(0.5)
+                        continue
+                    # Any other error (e.g. function not found) means VBA IS ready.
                 except Exception:
-                    # IsVbaRunning not present in this workbook – skip that check.
                     pass
-                return  # Both checks passed
+                return  # All checks passed
             except Exception:
                 pass
             time.sleep(0.5)
@@ -2313,7 +2330,36 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         f"    ThisWorkbook.CheckCompatibility = bCheck\n"
                         f"End Sub"
                     )
-                    self.app.Run(f"{_MACRO_MOD}.{_MACRO_NAME}")
+                    # After modifying VBProject, wait for Excel to finish recompiling
+                    # before calling Application.Run – otherwise we get 0x800AC3D4.
+                    self._wait_for_ready(timeout=15.0)
+                    # Use workbook-qualified name so Excel finds the macro regardless
+                    # of which workbook is currently active.
+                    import pywintypes
+                    wb_name = self.doc.Name
+                    macro_name = f"'{wb_name}'!{_MACRO_MOD}.{_MACRO_NAME}"
+                    last_run_err = None
+                    for _attempt in range(5):
+                        try:
+                            self.app.Run(macro_name)
+                            last_run_err = None
+                            break
+                        except pywintypes.com_error as ce:
+                            scode = ce.hresult
+                            if ce.excepinfo and ce.excepinfo[5]:
+                                scode = ce.excepinfo[5]
+                            last_run_err = ce
+                            if scode == self._SCODE_VBA_BUSY:
+                                logger.debug(f"Application.Run busy (attempt {_attempt + 1}/5), retrying...")
+                                import time
+                                time.sleep(1.0)
+                                continue
+                            break  # Non-busy error – no point retrying
+                        except Exception as e:
+                            last_run_err = e
+                            break
+                    if last_run_err is not None:
+                        raise last_run_err
                     components.Remove(tmp)
                     logger.info("Document has been saved and left open for further editing")
                     return
