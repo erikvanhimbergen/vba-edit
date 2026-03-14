@@ -987,11 +987,17 @@ class OfficeVBAHandler(ABC):
                     # conflicts when the document is already open there).
                     self.app = win32com.client.GetActiveObject(self.app_progid)
                     logger.debug(f"Connected to running {self.app_name} instance")
+                    # Do NOT call Visible = True here for any app: _open_document_impl
+                    # sets visibility exactly once after the workbook is obtained,
+                    # preventing an unwanted window-to-front / flash on each run.
                 except Exception:
                     self.app = win32com.client.Dispatch(self.app_progid)
                     logger.debug(f"Created new {self.app_name} instance")
-                if self.app_name != "Access":
-                    self.app.Visible = True
+                    if self.app_name not in ("Access", "Excel"):
+                        # For non-Excel apps (Word, PowerPoint) keep the original
+                        # behaviour; Excel handles its own visibility in
+                        # _open_document_impl to avoid spurious window creation.
+                        self.app.Visible = True
         except Exception as e:
             error_msg = f"Failed to initialize {self.app_name} application"
             logger.error(f"{error_msg}: {str(e)}")
@@ -1442,14 +1448,16 @@ class OfficeVBAHandler(ABC):
             # Try to get existing component
             component = components(name)
 
-            # For UserForms and Class modules with headers, always use full import via temporary file
-            if module_type == VBAModuleType.FORM or (module_type == VBAModuleType.CLASS and header):
-                logger.debug(f"Using full import for {module_type.name.lower()} with headers: {name}")
+            # Re-importing an existing class module can leave the workbook in an
+            # unsaveable state in Excel, even when the class content itself is valid.
+            # Existing class modules are therefore updated in-place, just like
+            # standard/document modules. UserForms still require full import.
+            if module_type == VBAModuleType.FORM:
+                logger.debug(f"Using full import for existing form with headers: {name}")
                 components.Remove(component)
                 self._import_via_temp_file(name, full_content, components, file_path.suffix, original_file=file_path)
             else:
-                # For standard modules or class modules without headers, just update content
-                logger.debug(f"Updating existing component: {name}")
+                logger.debug(f"Updating existing component in-place: {name}")
                 self._update_module_content(component, code)
 
         except Exception:
@@ -1583,8 +1591,9 @@ class OfficeVBAHandler(ABC):
         Returns:
             bool: True if module should be removed and reimported
         """
-        # Force import for forms (always) and class modules (when they have headers)
-        return module_type in [VBAModuleType.FORM, VBAModuleType.CLASS]
+        # Force full import only for UserForms. Existing class modules are updated
+        # in-place because re-import can corrupt the workbook save state in Excel.
+        return module_type == VBAModuleType.FORM
 
     def _import_new_module(
         self, name: str, content: str, module_type: VBAModuleType, components: Any, in_file_headers: bool = True
@@ -2254,6 +2263,27 @@ class ExcelVBAHandler(OfficeVBAHandler):
                     # Any other error (e.g. function not found) means VBA IS ready.
                 except Exception:
                     pass
+
+                # Also check whether workbook-specific async work is still running.
+                try:
+                    is_busy = self.app.Run("IsWorkbookBusy")
+                    if is_busy:
+                        logger.debug("Waiting for workbook to become idle (IsWorkbookBusy = True)...")
+                        time.sleep(0.5)
+                        continue
+                except pywintypes.com_error as ce:
+                    scode = ce.hresult
+                    if ce.excepinfo and ce.excepinfo[5]:
+                        scode = ce.excepinfo[5]
+                    if scode == self._SCODE_VBA_BUSY:
+                        logger.debug("Waiting: VBA engine not ready for IsWorkbookBusy check (0x800AC3D4)...")
+                        time.sleep(0.5)
+                        continue
+                    # Any other error (e.g. function not found) means this workbook
+                    # does not expose IsWorkbookBusy; skip the check.
+                except Exception:
+                    pass
+
                 return  # All checks passed
             except Exception:
                 pass
@@ -2261,23 +2291,79 @@ class ExcelVBAHandler(OfficeVBAHandler):
         logger.debug("Excel ready-wait timed out; proceeding anyway")
 
     def _open_document_impl(self) -> Any:
-        """Implementation-specific document opening logic."""
+        """Implementation-specific document opening logic.
+
+        Uses three strategies in order to connect to the workbook without
+        creating a spurious visible Excel window:
+
+        1. Enumerate workbooks already open in self.app (fast path, handles
+           OneDrive/UNC path variations that defeat ROT lookup).
+        2. win32com.client.GetObject(path) – Windows ROT lookup; works when
+           GetActiveObject connected to a different instance than the one that
+           owns the workbook.
+        3. Workbooks.Open – only reached when the file genuinely is not open
+           anywhere; self.app.Visible is set only after the open completes so
+           the window appears once, cleanly.
+        """
         try:
+            old_app = self.app
+            target_path_lower = str(self.doc_path).lower()
+            target_name_lower = Path(str(self.doc_path)).name.lower()
+            wb = None
+
+            # Strategy 1: search workbooks already loaded in the connected instance.
+            # This is the primary path when GetActiveObject successfully attached to
+            # the running Excel.  It is immune to path-format mismatches (OneDrive
+            # shadow paths, drive-letter vs UNC, etc.) that can cause GetObject to
+            # raise an error even though the file is visibly open.
             try:
-                # win32com.client.GetObject(path) looks up the file in the Windows
-                # Running Object Table. If the workbook is open in *any* Excel instance
-                # it returns the existing, writable Workbook object directly.
-                # This is more reliable than iterating self.app.Workbooks which only
-                # sees the one instance we happen to have connected to.
-                wb = win32com.client.GetObject(str(self.doc_path))
-                # Sync self.app to the instance that actually owns this workbook.
-                self.app = wb.Application
-                self.app.Visible = True
-                logger.debug("Obtained workbook via GetObject (file already open)")
+                for i in range(1, self.app.Workbooks.Count + 1):
+                    try:
+                        candidate = self.app.Workbooks.Item(i)
+                        if (candidate.FullName.lower() == target_path_lower
+                                or candidate.Name.lower() == target_name_lower):
+                            wb = candidate
+                            logger.debug("Obtained workbook from existing app instance (workbook enumeration)")
+                            break
+                    except Exception:
+                        continue
             except Exception:
-                # File is not open in any instance – open it via the app we initialised.
+                pass
+
+            # Strategy 2: try Windows ROT lookup via GetObject(path).
+            # Useful when GetActiveObject connected to a different Excel instance
+            # than the one that has VS_TOOL.xlsm open (multiple-instance scenario).
+            if wb is None:
+                try:
+                    wb = win32com.client.GetObject(str(self.doc_path))
+                    self.app = wb.Application
+                    logger.debug("Obtained workbook via GetObject (file already open)")
+                    # Quit orphaned Dispatch-created instance if it has no workbooks.
+                    try:
+                        if (
+                            old_app is not None
+                            and old_app.Hwnd != self.app.Hwnd
+                            and old_app.Workbooks.Count == 0
+                        ):
+                            old_app.Quit()
+                            logger.debug("Closed orphaned Excel instance created by Dispatch fallback")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # Strategy 3: file genuinely not open anywhere – open it fresh.
+            if wb is None:
                 logger.debug(f"Opening workbook via Workbooks.Open: {self.doc_path}")
                 wb = self.app.Workbooks.Open(str(self.doc_path))
+                logger.debug("Opened workbook via Workbooks.Open")
+
+            # Make Excel visible only once, after we have the workbook.
+            # This prevents a second Visible=True call (and the resulting window
+            # flash / bring-to-front) when the workbook was already open.
+            if not self.app.Visible:
+                self.app.Visible = True
+
             # Wait until Workbook_Open and any other startup events have finished
             # before we start manipulating VBProject components.
             self._wait_for_ready()
@@ -2286,15 +2372,7 @@ class ExcelVBAHandler(OfficeVBAHandler):
             raise VBAError(f"Failed to open workbook: {str(e)}") from e
 
     def save_document(self) -> None:
-        """Save the workbook using a VBA macro run from within Excel.
-
-        Calling doc.Save() directly from COM can fail with error 1004 due to
-        COM apartment / proxy issues when Excel is in certain UI states.
-        Running a macro via Application.Run executes on Excel's own VBA thread,
-        which bypasses those marshaling problems entirely.
-        Falls back to direct doc.Save() if macro injection fails, and falls back
-        to a manual-save warning if all automatic save attempts fail.
-        """
+        """Save the workbook."""
         if self.doc is not None:
             try:
                 if getattr(self.doc, 'ReadOnly', False):
@@ -2304,91 +2382,10 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         "it was already locked by another Excel instance."
                     )
 
-                # Wait for Excel to be idle before touching VBProject or running macros.
                 self._wait_for_ready()
 
                 if self.app is not None:
                     self.app.DisplayAlerts = False
-
-                # Strategy 1: inject a temporary VBA module and run Save() from
-                # within Excel's own VBA thread.  This avoids COM-marshaling
-                # issues that cause error 1004 when calling doc.Save() directly.
-                #
-                # The macro self-removes itself from VBProject BEFORE calling Save so
-                # the saved file never contains the temporary module.  Cleanup via
-                # 'tmp' reference in the finally block ensures that even if the macro
-                # never ran (e.g. VBA engine still busy), "Module1" is never left
-                # behind in the workbook.
-                _MACRO_MOD = "_VbaEditAutoSave_"
-                _MACRO_NAME = "__Save__"
-                tmp = None
-                components = None
-                try:
-                    components = self.doc.VBProject.VBComponents
-                    # Pre-cleanup: remove any leftover module from a previous failed run.
-                    try:
-                        components.Remove(components(_MACRO_MOD))
-                    except Exception:
-                        pass
-                    tmp = components.Add(1)  # vbext_ct_StdModule; initially named "Module1"
-                    tmp.Name = _MACRO_MOD
-                    tmp.CodeModule.AddFromString(
-                        f"Sub {_MACRO_NAME}()\n"
-                        f"    Dim bCheck As Boolean\n"
-                        f"    bCheck = ThisWorkbook.CheckCompatibility\n"
-                        f"    ThisWorkbook.CheckCompatibility = False\n"
-                        f"    Application.DisplayAlerts = False\n"
-                        f"    ' Self-remove before saving so the module is never written to disk\n"
-                        f"    ThisWorkbook.VBProject.VBComponents.Remove "
-                        f"ThisWorkbook.VBProject.VBComponents(\"{_MACRO_MOD}\")\n"
-                        f"    ThisWorkbook.Save\n"
-                        f"End Sub"
-                    )
-                    # After modifying VBProject, wait for Excel to finish recompiling
-                    # before calling Application.Run – otherwise we get 0x800AC3D4.
-                    self._wait_for_ready(timeout=15.0)
-                    # Use workbook-qualified name so Excel finds the macro regardless
-                    # of which workbook is currently active.
-                    import pywintypes
-                    wb_name = self.doc.Name
-                    macro_name = f"'{wb_name}'!{_MACRO_MOD}.{_MACRO_NAME}"
-                    last_run_err = None
-                    for _attempt in range(5):
-                        try:
-                            self.app.Run(macro_name)
-                            last_run_err = None
-                            break
-                        except pywintypes.com_error as ce:
-                            scode = ce.hresult
-                            if ce.excepinfo and ce.excepinfo[5]:
-                                scode = ce.excepinfo[5]
-                            last_run_err = ce
-                            if scode == self._SCODE_VBA_BUSY:
-                                logger.debug(f"Application.Run busy (attempt {_attempt + 1}/5), retrying...")
-                                import time
-                                time.sleep(1.0)
-                                continue
-                            break  # Non-busy error – no point retrying
-                        except Exception as e:
-                            last_run_err = e
-                            break
-                    if last_run_err is not None:
-                        raise last_run_err
-                    tmp = None  # macro self-removed the module; skip finally cleanup
-                    logger.info("Document has been saved and left open for further editing")
-                    return
-                except Exception as macro_err:
-                    logger.warning(f"Macro-based save failed ({macro_err}), trying direct Save()")
-                finally:
-                    # Always clean up by reference so "Module1" never leaks into the
-                    # workbook, regardless of where in strategy 1 an exception occurred.
-                    if tmp is not None and components is not None:
-                        try:
-                            components.Remove(tmp)
-                        except Exception:
-                            pass
-
-                # Strategy 2: direct doc.Save() with DisplayAlerts and CheckCompatibility suppressed
                 self.doc.CheckCompatibility = False
                 self.doc.Save()
                 logger.info("Document has been saved and left open for further editing")
@@ -2396,8 +2393,6 @@ class ExcelVBAHandler(OfficeVBAHandler):
             except VBAError:
                 raise
             except Exception as e:
-                # Strategy 3: warn the user – the VBA code is already imported
-                # in memory; just needs a manual Ctrl+S
                 logger.warning(
                     f"\nAutomatic save failed ({e}).\n"
                     "VBA code has been imported successfully into the workbook.\n"
