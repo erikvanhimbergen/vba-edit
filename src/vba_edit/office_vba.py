@@ -2210,22 +2210,36 @@ class ExcelVBAHandler(OfficeVBAHandler):
         return "ThisWorkbook"
 
     def _wait_for_ready(self, timeout: float = 30.0) -> None:
-        """Poll Application.Ready until Excel is idle or timeout expires.
+        """Poll until Excel is idle and no VBA event handlers are running.
 
-        This is necessary because Workbook_Open (and other event handlers) may
-        still be running after the workbook is obtained via COM.  Attempting to
-        inject VBA modules or run macros while Excel is busy results in
-        'Er is een uitzondering opgetreden' errors (-2146778156).
+        Strategy:
+        1. Check Application.Ready (Excel's own idle flag).
+        2. If the workbook exposes IsVbaRunning() (via A_RUNSTATE module),
+           poll that as well.  This catches cases where Application.Ready is
+           already True but Workbook_Open (or another event) is still executing.
+        3. Fall through after timeout so the tool is never blocked indefinitely.
         """
         import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                if self.app.Ready:
-                    return
+                if not self.app.Ready:
+                    logger.debug("Waiting for Excel to become ready (Application.Ready = False)...")
+                    time.sleep(0.5)
+                    continue
+                # Application.Ready is True – also check the workbook's own counter.
+                try:
+                    is_running = self.app.Run("IsVbaRunning")
+                    if is_running:
+                        logger.debug("Waiting for VBA event handlers to finish (IsVbaRunning = True)...")
+                        time.sleep(0.5)
+                        continue
+                except Exception:
+                    # IsVbaRunning not present in this workbook – skip that check.
+                    pass
+                return  # Both checks passed
             except Exception:
                 pass
-            logger.debug("Waiting for Excel to become ready...")
             time.sleep(0.5)
         logger.debug("Excel ready-wait timed out; proceeding anyway")
 
