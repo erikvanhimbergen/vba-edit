@@ -2224,6 +2224,8 @@ class ExcelVBAHandler(OfficeVBAHandler):
     # HRESULT scode returned by Application.Run when the VBA engine is not yet
     # ready to execute macros (e.g. still compiling after bulk VBProject edits).
     _SCODE_VBA_BUSY = -2146778156  # 0x800AC3D4
+    _RUNSTATE_IS_RUNNING = "VBAEDIT_IsVbaRunning"
+    _RUNSTATE_IS_BUSY = "VBAEDIT_IsWorkbookBusy"
 
     _DEFAULT_RUNSTATE_MODULE_CODE = (
         "Option Explicit\n"
@@ -2260,6 +2262,42 @@ class ExcelVBAHandler(OfficeVBAHandler):
         "\n"
         "    IsWorkbookBusy = False\n"
         "End Property\n"
+        "\n"
+        "Public Function VBAEDIT_IsVbaRunning() As Boolean\n"
+        "    On Error GoTo Fallback\n"
+        "    VBAEDIT_IsVbaRunning = IsVbaRunning\n"
+        "    Exit Function\n"
+        "Fallback:\n"
+        "    VBAEDIT_IsVbaRunning = False\n"
+        "End Function\n"
+        "\n"
+        "Public Function VBAEDIT_IsWorkbookBusy() As Boolean\n"
+        "    On Error GoTo Fallback\n"
+        "    VBAEDIT_IsWorkbookBusy = IsWorkbookBusy\n"
+        "    Exit Function\n"
+        "Fallback:\n"
+        "    VBAEDIT_IsWorkbookBusy = False\n"
+        "End Function\n"
+    )
+
+    _DEFAULT_RUNSTATE_WRAPPER_CODE = (
+        "Option Explicit\n"
+        "\n"
+        "Public Function VBAEDIT_IsVbaRunning() As Boolean\n"
+        "    On Error GoTo Fallback\n"
+        "    VBAEDIT_IsVbaRunning = IsVbaRunning\n"
+        "    Exit Function\n"
+        "Fallback:\n"
+        "    VBAEDIT_IsVbaRunning = False\n"
+        "End Function\n"
+        "\n"
+        "Public Function VBAEDIT_IsWorkbookBusy() As Boolean\n"
+        "    On Error GoTo Fallback\n"
+        "    VBAEDIT_IsWorkbookBusy = IsWorkbookBusy\n"
+        "    Exit Function\n"
+        "Fallback:\n"
+        "    VBAEDIT_IsWorkbookBusy = False\n"
+        "End Function\n"
     )
 
     def _get_runstate_module_code(self) -> str:
@@ -2284,17 +2322,27 @@ class ExcelVBAHandler(OfficeVBAHandler):
         """
         try:
             components = wb.VBProject.VBComponents
+            component = None
             try:
-                _ = components("A_RUNSTATE")
-                return
+                component = components("A_RUNSTATE")
             except Exception:
-                pass
+                logger.warning("Workbook is missing A_RUNSTATE module; adding it automatically.")
+                component = components.Add(VBATypes.VBEXT_CT_STDMODULE)
+                component.Name = "A_RUNSTATE"
+                component.CodeModule.AddFromString(_filter_attributes(self._get_runstate_module_code()))
+                logger.info("Added missing A_RUNSTATE module to workbook.")
+                return
 
-            logger.warning("Workbook is missing A_RUNSTATE module; adding it automatically.")
-            component = components.Add(VBATypes.VBEXT_CT_STDMODULE)
-            component.Name = "A_RUNSTATE"
-            component.CodeModule.AddFromString(_filter_attributes(self._get_runstate_module_code()))
-            logger.info("Added missing A_RUNSTATE module to workbook.")
+            # Existing module: ensure runnable wrapper functions are present.
+            code_module = component.CodeModule
+            module_text = ""
+            if code_module.CountOfLines > 0:
+                module_text = code_module.Lines(1, code_module.CountOfLines)
+            has_is_running_wrapper = self._RUNSTATE_IS_RUNNING.lower() in module_text.lower()
+            has_is_busy_wrapper = self._RUNSTATE_IS_BUSY.lower() in module_text.lower()
+            if not has_is_running_wrapper or not has_is_busy_wrapper:
+                code_module.AddFromString(_filter_attributes(self._DEFAULT_RUNSTATE_WRAPPER_CODE))
+                logger.info("Updated A_RUNSTATE module with VBAEDIT readiness wrappers.")
         except Exception as e:
             if is_vba_access_error(e):
                 details = get_vba_error_details(e)
@@ -2309,11 +2357,14 @@ class ExcelVBAHandler(OfficeVBAHandler):
     def _requires_strict_readiness_macros(self) -> bool:
         """Return True when this project expects A_RUNSTATE readiness macros.
 
-        If A_RUNSTATE.bas exists in the VBA source directory, missing readiness
-        macros should be treated as a startup error instead of a soft warning.
+        Strict readiness enforcement is opt-in because some Excel security setups
+        block Application.Run even when the workbook is otherwise usable for edit
+        sessions. Set VBA_EDIT_STRICT_READINESS=1 to enable fail-fast behavior.
         """
         try:
-            return (self.vba_dir / "A_RUNSTATE.bas").exists()
+            strict_env = os.environ.get("VBA_EDIT_STRICT_READINESS", "").strip().lower()
+            strict_enabled = strict_env in ("1", "true", "yes", "on")
+            return strict_enabled and (self.vba_dir / "A_RUNSTATE.bas").exists()
         except Exception:
             return False
 
@@ -2352,6 +2403,36 @@ class ExcelVBAHandler(OfficeVBAHandler):
                 "Enable macros/trusted location and reopen the workbook."
             )
 
+    def _run_readiness_macro(self, macro_name: str) -> Any:
+        """Run readiness macro with multiple qualification variants.
+
+        Different Excel/COM contexts resolve Application.Run names differently.
+        Try workbook-qualified and module-qualified variants before failing.
+        """
+        candidates = []
+
+        try:
+            if self.doc is not None:
+                wb_name = self.doc.Name
+                candidates.append(f"'{wb_name}'!A_RUNSTATE.{macro_name}")
+                candidates.append(f"'{wb_name}'!{macro_name}")
+        except Exception:
+            pass
+
+        candidates.append(f"A_RUNSTATE.{macro_name}")
+        candidates.append(macro_name)
+
+        last_error = None
+        for candidate in candidates:
+            try:
+                return self.app.Run(candidate)
+            except Exception as e:
+                last_error = e
+
+        if last_error is not None:
+            raise last_error
+        raise VBAError(f"Unable to execute readiness macro: {macro_name}")
+
     def _wait_for_ready(self, timeout: float = 30.0) -> None:
         """Poll until Excel is idle and no VBA event handlers are running.
 
@@ -2375,7 +2456,7 @@ class ExcelVBAHandler(OfficeVBAHandler):
                     continue
                 # Application.Ready is True – also check the workbook's own counter.
                 try:
-                    is_running = self.app.Run("IsVbaRunning")
+                    is_running = self._run_readiness_macro(self._RUNSTATE_IS_RUNNING)
                     if is_running:
                         logger.debug("Waiting for VBA event handlers to finish (IsVbaRunning = True)...")
                         time.sleep(0.5)
@@ -2391,13 +2472,13 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         time.sleep(0.5)
                         continue
                     # Any other error (e.g. function not found) means VBA IS ready.
-                    self._handle_readiness_macro_unavailable("IsVbaRunning", ce)
+                    self._handle_readiness_macro_unavailable(self._RUNSTATE_IS_RUNNING, ce)
                 except Exception as e:
-                    self._handle_readiness_macro_unavailable("IsVbaRunning", e)
+                    self._handle_readiness_macro_unavailable(self._RUNSTATE_IS_RUNNING, e)
 
                 # Also check whether workbook-specific async work is still running.
                 try:
-                    is_busy = self.app.Run("IsWorkbookBusy")
+                    is_busy = self._run_readiness_macro(self._RUNSTATE_IS_BUSY)
                     if is_busy:
                         logger.debug("Waiting for workbook to become idle (IsWorkbookBusy = True)...")
                         time.sleep(0.5)
@@ -2412,9 +2493,9 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         continue
                     # Any other error (e.g. function not found) means this workbook
                     # does not expose IsWorkbookBusy; skip the check.
-                    self._handle_readiness_macro_unavailable("IsWorkbookBusy", ce)
+                    self._handle_readiness_macro_unavailable(self._RUNSTATE_IS_BUSY, ce)
                 except Exception as e:
-                    self._handle_readiness_macro_unavailable("IsWorkbookBusy", e)
+                    self._handle_readiness_macro_unavailable(self._RUNSTATE_IS_BUSY, e)
 
                 return  # All checks passed
             except VBAError:
