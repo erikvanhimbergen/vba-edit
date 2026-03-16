@@ -856,6 +856,7 @@ class OfficeVBAHandler(ABC):
             self.in_file_headers = in_file_headers
             self.app = None
             self.doc = None
+            self._created_new_app_instance = False
             self.component_handler = VBAComponentHandler(use_rubberduck_folders)
 
             # Configure logging
@@ -986,12 +987,14 @@ class OfficeVBAHandler(ABC):
                     # the same instance the user is working in (avoids read-only
                     # conflicts when the document is already open there).
                     self.app = win32com.client.GetActiveObject(self.app_progid)
+                    self._created_new_app_instance = False
                     logger.debug(f"Connected to running {self.app_name} instance")
                     # Do NOT call Visible = True here for any app: _open_document_impl
                     # sets visibility exactly once after the workbook is obtained,
                     # preventing an unwanted window-to-front / flash on each run.
                 except Exception:
                     self.app = win32com.client.Dispatch(self.app_progid)
+                    self._created_new_app_instance = True
                     logger.debug(f"Created new {self.app_name} instance")
                     if self.app_name not in ("Access", "Excel"):
                         # For non-Excel apps (Word, PowerPoint) keep the original
@@ -2222,6 +2225,133 @@ class ExcelVBAHandler(OfficeVBAHandler):
     # ready to execute macros (e.g. still compiling after bulk VBProject edits).
     _SCODE_VBA_BUSY = -2146778156  # 0x800AC3D4
 
+    _DEFAULT_RUNSTATE_MODULE_CODE = (
+        "Option Explicit\n"
+        "Option Compare Text\n"
+        "\n"
+        "Private m_IsRunning As Long '0 = False, <>0 = True\n"
+        "\n"
+        "Public Sub EnterProc()\n"
+        "    m_IsRunning = m_IsRunning + 1\n"
+        "End Sub\n"
+        "\n"
+        "Public Sub ExitProc()\n"
+        "    If m_IsRunning > 0 Then m_IsRunning = m_IsRunning - 1\n"
+        "End Sub\n"
+        "\n"
+        "Public Property Get IsVbaRunning() As Boolean\n"
+        "    IsVbaRunning = (m_IsRunning > 0)\n"
+        "End Property\n"
+        "\n"
+        "Public Property Get IsWorkbookBusy() As Boolean\n"
+        "    If m_IsRunning > 0 Then\n"
+        "        IsWorkbookBusy = True\n"
+        "        Exit Property\n"
+        "    End If\n"
+        "\n"
+        "    On Error Resume Next\n"
+        "    Dim callbacks As Long\n"
+        "    callbacks = MONA.nbCallbacks\n"
+        "    If Err.Number = 0 And callbacks > 0 Then\n"
+        "        IsWorkbookBusy = True\n"
+        "        Exit Property\n"
+        "    End If\n"
+        "    On Error GoTo 0\n"
+        "\n"
+        "    IsWorkbookBusy = False\n"
+        "End Property\n"
+    )
+
+    def _get_runstate_module_code(self) -> str:
+        """Load A_RUNSTATE code from source directory, fallback to built-in default."""
+        try:
+            runstate_file = self.vba_dir / "A_RUNSTATE.bas"
+            if runstate_file.exists():
+                with open(runstate_file, "r", encoding=self.encoding) as f:
+                    content = f.read()
+                _header, code = self.component_handler.split_vba_content(content)
+                if code.strip():
+                    return code
+        except Exception as e:
+            logger.debug(f"Could not read A_RUNSTATE.bas from source directory: {e}")
+        return self._DEFAULT_RUNSTATE_MODULE_CODE
+
+    def _ensure_runstate_module_exists(self, wb: Any) -> None:
+        """Ensure the target workbook contains A_RUNSTATE module.
+
+        If missing, add a standard module named A_RUNSTATE with the required
+        readiness functions used by vba-edit.
+        """
+        try:
+            components = wb.VBProject.VBComponents
+            try:
+                _ = components("A_RUNSTATE")
+                return
+            except Exception:
+                pass
+
+            logger.warning("Workbook is missing A_RUNSTATE module; adding it automatically.")
+            component = components.Add(VBATypes.VBEXT_CT_STDMODULE)
+            component.Name = "A_RUNSTATE"
+            component.CodeModule.AddFromString(_filter_attributes(self._get_runstate_module_code()))
+            logger.info("Added missing A_RUNSTATE module to workbook.")
+        except Exception as e:
+            if is_vba_access_error(e):
+                details = get_vba_error_details(e)
+                raise VBAAccessError(
+                    f"Cannot ensure A_RUNSTATE module in {details['source']}. "
+                    f"Error: {details['description']}\n"
+                    f"Please ensure 'Trust access to the VBA project object model' "
+                    f"is enabled in Trust Center Settings."
+                ) from e
+            raise
+
+    def _requires_strict_readiness_macros(self) -> bool:
+        """Return True when this project expects A_RUNSTATE readiness macros.
+
+        If A_RUNSTATE.bas exists in the VBA source directory, missing readiness
+        macros should be treated as a startup error instead of a soft warning.
+        """
+        try:
+            return (self.vba_dir / "A_RUNSTATE.bas").exists()
+        except Exception:
+            return False
+
+    def _warn_macro_readiness_unavailable(self, macro_name: str, err: Exception) -> None:
+        """Log a one-time warning when workbook readiness macros cannot be called.
+
+        This safeguards edit mode against a confusing partial-startup state where
+        Workbook_Open-dependent checks cannot run (for example when macros are
+        blocked by Trust Center settings).
+        """
+        try:
+            already_warned = getattr(self, "_macro_readiness_warning_emitted", False)
+            if already_warned:
+                return
+            self._macro_readiness_warning_emitted = True
+            logger.warning(
+                "Workbook readiness check macro '%s' is unavailable (%s). "
+                "Readiness verification cannot be completed. "
+                "If workbook startup seems incomplete, enable macros/trusted location "
+                "and reopen the workbook.",
+                macro_name,
+                str(err),
+            )
+        except Exception:
+            # Never let warning/reporting logic interfere with opening the workbook.
+            pass
+
+    def _handle_readiness_macro_unavailable(self, macro_name: str, err: Exception) -> None:
+        """Warn and optionally fail-fast when readiness macros cannot be executed."""
+        self._warn_macro_readiness_unavailable(macro_name, err)
+        if self._requires_strict_readiness_macros():
+            raise VBAError(
+                f"Required workbook readiness macro '{macro_name}' is unavailable. "
+                f"Cause: {err}. "
+                "This project uses A_RUNSTATE.bas, so startup cannot be safely verified. "
+                "Enable macros/trusted location and reopen the workbook."
+            )
+
     def _wait_for_ready(self, timeout: float = 30.0) -> None:
         """Poll until Excel is idle and no VBA event handlers are running.
 
@@ -2261,8 +2391,9 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         time.sleep(0.5)
                         continue
                     # Any other error (e.g. function not found) means VBA IS ready.
-                except Exception:
-                    pass
+                    self._handle_readiness_macro_unavailable("IsVbaRunning", ce)
+                except Exception as e:
+                    self._handle_readiness_macro_unavailable("IsVbaRunning", e)
 
                 # Also check whether workbook-specific async work is still running.
                 try:
@@ -2281,10 +2412,13 @@ class ExcelVBAHandler(OfficeVBAHandler):
                         continue
                     # Any other error (e.g. function not found) means this workbook
                     # does not expose IsWorkbookBusy; skip the check.
-                except Exception:
-                    pass
+                    self._handle_readiness_macro_unavailable("IsWorkbookBusy", ce)
+                except Exception as e:
+                    self._handle_readiness_macro_unavailable("IsWorkbookBusy", e)
 
                 return  # All checks passed
+            except VBAError:
+                raise
             except Exception:
                 pass
             time.sleep(0.5)
@@ -2335,20 +2469,31 @@ class ExcelVBAHandler(OfficeVBAHandler):
             # than the one that has VS_TOOL.xlsm open (multiple-instance scenario).
             if wb is None:
                 try:
-                    wb = win32com.client.GetObject(str(self.doc_path))
-                    self.app = wb.Application
-                    logger.debug("Obtained workbook via GetObject (file already open)")
-                    # Quit orphaned Dispatch-created instance if it has no workbooks.
+                    # When we just created a fresh, empty Excel instance, GetObject(path)
+                    # can open the workbook with a hidden window. In that case we prefer
+                    # Workbooks.Open in this instance to keep normal UI behavior.
+                    should_try_getobject = True
                     try:
-                        if (
-                            old_app is not None
-                            and old_app.Hwnd != self.app.Hwnd
-                            and old_app.Workbooks.Count == 0
-                        ):
-                            old_app.Quit()
-                            logger.debug("Closed orphaned Excel instance created by Dispatch fallback")
+                        if self._created_new_app_instance and self.app.Workbooks.Count == 0:
+                            should_try_getobject = False
                     except Exception:
                         pass
+
+                    if should_try_getobject:
+                        wb = win32com.client.GetObject(str(self.doc_path))
+                        self.app = wb.Application
+                        logger.debug("Obtained workbook via GetObject (file already open)")
+                        # Quit orphaned Dispatch-created instance if it has no workbooks.
+                        try:
+                            if (
+                                old_app is not None
+                                and old_app.Hwnd != self.app.Hwnd
+                                and old_app.Workbooks.Count == 0
+                            ):
+                                old_app.Quit()
+                                logger.debug("Closed orphaned Excel instance created by Dispatch fallback")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -2363,6 +2508,22 @@ class ExcelVBAHandler(OfficeVBAHandler):
             # flash / bring-to-front) when the workbook was already open.
             if not self.app.Visible:
                 self.app.Visible = True
+
+            # Normalize workbook UI state: when attached via GetObject, some Excel
+            # versions return a workbook with a hidden window. Ensure the main window
+            # is visible and active so worksheet tabs/sheets are actually shown.
+            try:
+                if wb.Windows.Count > 0:
+                    win = wb.Windows.Item(1)
+                    if not win.Visible:
+                        win.Visible = True
+                    win.Activate()
+                wb.Activate()
+            except Exception:
+                pass
+
+            # Ensure the workbook has the runstate module expected by readiness checks.
+            self._ensure_runstate_module_exists(wb)
 
             # Wait until Workbook_Open and any other startup events have finished
             # before we start manipulating VBProject components.
