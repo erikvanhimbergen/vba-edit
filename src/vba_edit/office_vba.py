@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -977,6 +978,10 @@ class OfficeVBAHandler(ABC):
                 raise RPCError(self.app_name)
             raise DocumentClosedError(self.document_type)
 
+    def _maintain_runtime_ui(self) -> None:
+        """Optional runtime UI maintenance hook for app-specific handlers."""
+        return
+
     def initialize_app(self) -> None:
         """Initialize the Office application."""
         try:
@@ -988,6 +993,30 @@ class OfficeVBAHandler(ABC):
                     # conflicts when the document is already open there).
                     self.app = win32com.client.GetActiveObject(self.app_progid)
                     self._created_new_app_instance = False
+                    # Excel can leave behind an orphan COM instance with zero
+                    # workbooks. Reusing it creates a blank top-level "Excel"
+                    # frame beside the real workbook window. Detect that case
+                    # and force the shell-open path instead.
+                    if self.app_name == "Excel":
+                        try:
+                            workbook_count = self.app.Workbooks.Count
+                        except Exception:
+                            workbook_count = -1
+                        if workbook_count == 0:
+                            logger.debug(
+                                "Connected Excel instance has zero workbooks; treating it as orphan and using shell-open path instead"
+                            )
+                            try:
+                                self._force_kill_orphan_excel = True
+                                self._shutdown_excel_instance(self.app)
+                                self._force_kill_orphan_excel = False
+                            except Exception:
+                                self._force_kill_orphan_excel = False
+                                pass
+                            self.app = None
+                            self._prefer_shell_open = True
+                        else:
+                            self._prefer_shell_open = False
                     logger.debug(f"Connected to running {self.app_name} instance")
                     # Do NOT call Visible = True here for any app: _open_document_impl
                     # sets visibility exactly once after the workbook is obtained,
@@ -995,6 +1024,7 @@ class OfficeVBAHandler(ABC):
                 except Exception:
                     self.app = win32com.client.Dispatch(self.app_progid)
                     self._created_new_app_instance = True
+                    self._prefer_shell_open = (self.app_name == "Excel")
                     logger.debug(f"Created new {self.app_name} instance")
                     if self.app_name not in ("Access", "Excel"):
                         # For non-Excel apps (Word, PowerPoint) keep the original
@@ -1837,7 +1867,7 @@ class OfficeVBAHandler(ABC):
         try:
             logger.info(f"Watching for changes in {self.vba_dir}...")
             last_check_time = time.time()
-            check_interval = 5  # Check connection every 5 seconds
+            check_interval = 1 if self.app_name == "Excel" else 5
 
             # Setup file patterns for watchfiles
             if self.use_rubberduck_folders:
@@ -1866,6 +1896,7 @@ class OfficeVBAHandler(ABC):
                     if current_time - last_check_time >= check_interval:
                         if not self.is_document_open():
                             raise DocumentClosedError(self.document_type)
+                        self._maintain_runtime_ui()
                         last_check_time = current_time
                         logger.debug("Connection check passed")
 
@@ -2221,6 +2252,13 @@ class ExcelVBAHandler(OfficeVBAHandler):
         """Get the name of the document module."""
         return "ThisWorkbook"
 
+    # Timestamp set after the workbook is fully open and ready. NewWindow() is
+    # only allowed to fire in the watch-loop after this grace period to prevent
+    # reacting to transient Windows.Count==0 glitches during the COM startup
+    # sequence.
+    _UI_REPAIR_GRACE_SECONDS = 15.0
+    _doc_open_time: float = 0.0
+
     # HRESULT scode returned by Application.Run when the VBA engine is not yet
     # ready to execute macros (e.g. still compiling after bulk VBProject edits).
     _SCODE_VBA_BUSY = -2146778156  # 0x800AC3D4
@@ -2380,14 +2418,21 @@ class ExcelVBAHandler(OfficeVBAHandler):
             if already_warned:
                 return
             self._macro_readiness_warning_emitted = True
-            logger.warning(
-                "Workbook readiness check macro '%s' is unavailable (%s). "
-                "Readiness verification cannot be completed. "
-                "If workbook startup seems incomplete, enable macros/trusted location "
-                "and reopen the workbook.",
-                macro_name,
-                str(err),
-            )
+            if self._requires_strict_readiness_macros():
+                logger.warning(
+                    "Workbook readiness check macro '%s' is unavailable (%s). "
+                    "Readiness verification cannot be completed. "
+                    "If workbook startup seems incomplete, enable macros/trusted location "
+                    "and reopen the workbook.",
+                    macro_name,
+                    str(err),
+                )
+            else:
+                logger.debug(
+                    "Readiness macro '%s' unavailable (%s); continuing with Application.Ready only.",
+                    macro_name,
+                    str(err),
+                )
         except Exception:
             # Never let warning/reporting logic interfere with opening the workbook.
             pass
@@ -2432,6 +2477,202 @@ class ExcelVBAHandler(OfficeVBAHandler):
         if last_error is not None:
             raise last_error
         raise VBAError(f"Unable to execute readiness macro: {macro_name}")
+
+    def _normalize_workbook_ui(self, wb: Any) -> None:
+        """Ensure workbook UI is visible/active in Excel.
+
+        Makes the Excel application and any existing workbook windows visible.
+        Does NOT create new windows — that is only done in the watch-loop
+        (_maintain_runtime_ui) after the workbook state has fully settled,
+        to avoid creating duplicate windows during the startup COM sequence.
+        """
+        try:
+            if not self.app.Visible:
+                self.app.Visible = True
+        except Exception:
+            pass
+
+        if wb is None:
+            return
+
+        # Ensure every existing window of this workbook is visible and not minimized.
+        try:
+            for i in range(1, wb.Windows.Count + 1):
+                try:
+                    win = wb.Windows.Item(i)
+                    win.Visible = True
+                    if win.WindowState == -4140:  # xlMinimized
+                        win.WindowState = -4143   # xlNormal
+                    win.DisplayWorkbookTabs = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Activate the workbook so it gets focus and a caption.
+        try:
+            wb.Activate()
+        except Exception:
+            pass
+
+    def _maintain_runtime_ui(self) -> None:
+        """Self-heal Excel UI if workbook window disappears during watch mode."""
+        try:
+            if self.doc is None or self.app is None:
+                return
+
+            needs_repair = False
+            try:
+                if not self.app.Visible:
+                    needs_repair = True
+            except Exception:
+                needs_repair = True
+
+            try:
+                if self.app.Windows.Count == 0:
+                    needs_repair = True
+            except Exception:
+                needs_repair = True
+
+            try:
+                if self.doc.Windows.Count == 0:
+                    needs_repair = True
+            except Exception:
+                needs_repair = True
+
+            try:
+                if self.app.ActiveWorkbook is None:
+                    needs_repair = True
+            except Exception:
+                needs_repair = True
+
+            if needs_repair:
+                logger.debug("Detected hidden/zero-window workbook state; normalizing Excel UI.")
+                self._normalize_workbook_ui(self.doc)
+                # Only create a new window after the grace period has elapsed.
+                # This prevents reacting to transient Windows.Count==0 glitches
+                # that occur during the COM startup sequence.
+                import time as _time
+                grace_elapsed = (_time.time() - self._doc_open_time) > self._UI_REPAIR_GRACE_SECONDS
+                if grace_elapsed:
+                    try:
+                        if self.doc.Windows.Count == 0:
+                            logger.info(
+                                "Workbook has no windows during watch; creating window via NewWindow()."
+                            )
+                            self.doc.NewWindow()
+                            self.doc.Activate()
+                    except Exception:
+                        pass
+        except Exception:
+            # Runtime UI healing should never stop edit mode.
+            pass
+
+    def _shutdown_excel_instance(self, app: Any) -> None:
+        """Best-effort shutdown for an orphan Excel instance.
+
+        Close open workbooks without prompts, then quit the application.
+        """
+        def _get_pid_from_hwnd(hwnd: int) -> int | None:
+            try:
+                import ctypes
+
+                pid = ctypes.c_ulong(0)
+                ctypes.windll.user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+                if pid.value > 0:
+                    return int(pid.value)
+            except Exception:
+                pass
+            return None
+
+        force_kill = bool(getattr(self, "_force_kill_orphan_excel", False))
+        orphan_pid = None
+        if force_kill:
+            try:
+                orphan_pid = _get_pid_from_hwnd(app.Hwnd)
+            except Exception:
+                orphan_pid = None
+
+        try:
+            app.DisplayAlerts = False
+        except Exception:
+            pass
+
+        try:
+            # Close from back to front to avoid index shifts.
+            for i in range(app.Workbooks.Count, 0, -1):
+                try:
+                    app.Workbooks.Item(i).Close(SaveChanges=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            app.Quit()
+        except Exception:
+            pass
+
+        if force_kill and orphan_pid is not None:
+            try:
+                # If Excel did not exit cleanly (e.g. hidden default Book window),
+                # force-terminate the exact orphan process created by the tool.
+                subprocess.run(
+                    ["taskkill", "/PID", str(orphan_pid), "/F", "/T"],
+                    capture_output=True,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+    def _cleanup_owned_instance_non_target_workbooks(self, target_wb: Any) -> None:
+        """In a tool-owned Excel instance, close non-target workbooks.
+
+        This removes stray blank windows/workbooks (e.g. default Book1) that can
+        leave users with an empty Excel window without sheet tabs or filename.
+        """
+        try:
+            if not self._created_new_app_instance:
+                return
+            if self.app is None:
+                return
+            if target_wb is None:
+                return
+            if target_wb.Application.Hwnd != self.app.Hwnd:
+                return
+
+            try:
+                self.app.DisplayAlerts = False
+            except Exception:
+                pass
+
+            target_name = ""
+            target_fullname = ""
+            try:
+                target_name = str(target_wb.Name).lower()
+            except Exception:
+                pass
+            try:
+                target_fullname = str(target_wb.FullName).lower()
+            except Exception:
+                pass
+
+            for i in range(self.app.Workbooks.Count, 0, -1):
+                try:
+                    candidate = self.app.Workbooks.Item(i)
+                    candidate_name = str(candidate.Name).lower()
+                    candidate_fullname = str(candidate.FullName).lower()
+                    is_target = False
+                    if target_fullname:
+                        is_target = (candidate_fullname == target_fullname)
+                    if not is_target and target_name:
+                        is_target = (candidate_name == target_name)
+                    if not is_target:
+                        candidate.Close(SaveChanges=False)
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def _wait_for_ready(self, timeout: float = 30.0) -> None:
         """Poll until Excel is idle and no VBA event handlers are running.
@@ -2563,26 +2804,114 @@ class ExcelVBAHandler(OfficeVBAHandler):
                     if should_try_getobject:
                         wb = win32com.client.GetObject(str(self.doc_path))
                         self.app = wb.Application
+                        self._created_new_app_instance = False
                         logger.debug("Obtained workbook via GetObject (file already open)")
-                        # Quit orphaned Dispatch-created instance if it has no workbooks.
+                        # Quit orphaned instance created by this tool after switching
+                        # to the workbook-owning Excel instance.
                         try:
                             if (
                                 old_app is not None
                                 and old_app.Hwnd != self.app.Hwnd
-                                and old_app.Workbooks.Count == 0
                             ):
-                                old_app.Quit()
-                                logger.debug("Closed orphaned Excel instance created by Dispatch fallback")
+                                should_close_old = False
+
+                                # If this instance was created by vba-edit, it is safe
+                                # to close it even when Excel started with a default blank
+                                # workbook window (Book1), which would otherwise leave a
+                                # confusing extra empty Excel window.
+                                if self._created_new_app_instance:
+                                    should_close_old = True
+                                else:
+                                    try:
+                                        should_close_old = old_app.Workbooks.Count == 0
+                                    except Exception:
+                                        should_close_old = False
+
+                                if should_close_old:
+                                    self._force_kill_orphan_excel = bool(self._created_new_app_instance)
+                                    self._shutdown_excel_instance(old_app)
+                                    self._force_kill_orphan_excel = False
+                                    logger.debug("Closed orphaned Excel instance after GetObject handover")
                         except Exception:
+                            self._force_kill_orphan_excel = False
                             pass
                 except Exception:
                     pass
 
             # Strategy 3: file genuinely not open anywhere – open it fresh.
             if wb is None:
-                logger.debug(f"Opening workbook via Workbooks.Open: {self.doc_path}")
-                wb = self.app.Workbooks.Open(str(self.doc_path))
-                logger.debug("Opened workbook via Workbooks.Open")
+                if self._created_new_app_instance or getattr(self, "_prefer_shell_open", False):
+                    # Dispatch() + Workbooks.Open always produces two OS-level windows:
+                    # a workbook SDI window AND the Excel Application Frame ("Excel")
+                    # shown as a separate blank taskbar entry.  The only reliable way
+                    # to avoid this is to open the file via os.startfile, exactly like
+                    # the user double-clicking it, which integrates the workbook into
+                    # a single application window.
+                    #
+                    # Fully terminate the headless/orphan COM instance first so
+                    # os.startfile cannot reuse the polluted Excel process.
+                    try:
+                        if self.app is not None:
+                            self._force_kill_orphan_excel = True
+                            self._shutdown_excel_instance(self.app)
+                            self._force_kill_orphan_excel = False
+                    except Exception:
+                        self._force_kill_orphan_excel = False
+                        pass
+                    self.app = None
+                    self._created_new_app_instance = False
+                    self._prefer_shell_open = False
+
+                    import os as _os
+                    import time as _time
+                    logger.debug(f"Opening workbook via os.startfile: {self.doc_path}")
+                    _os.startfile(str(self.doc_path))
+
+                    # Poll until the workbook registers in COM (up to 30 s).
+                    _deadline = _time.time() + 30.0
+                    while _time.time() < _deadline:
+                        _time.sleep(0.5)
+                        try:
+                            _app = win32com.client.GetActiveObject("Excel.Application")
+                            for _i in range(1, _app.Workbooks.Count + 1):
+                                try:
+                                    _c = _app.Workbooks.Item(_i)
+                                    if (_c.FullName.lower() == str(self.doc_path).lower()
+                                            or _c.Name.lower() == self.doc_path.name.lower()):
+                                        self.app = _app
+                                        wb = _c
+                                        break
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        if wb is not None:
+                            break
+
+                    if wb is None:
+                        raise VBAError(
+                            f"Workbook did not become accessible via COM within 30 s: "
+                            f"{self.doc_path}"
+                        )
+                    logger.debug("Obtained workbook after os.startfile open")
+                else:
+                    # Excel is already running but does not have this workbook open.
+                    # Open it inside the existing instance.
+                    logger.debug(f"Opening workbook via Workbooks.Open: {self.doc_path}")
+                    wb = self.app.Workbooks.Open(str(self.doc_path))
+                    logger.debug("Opened workbook via Workbooks.Open")
+                    # A workbook can have a saved multi-window layout from a previous
+                    # broken session.  Close any extras to avoid duplicate windows.
+                    try:
+                        while wb.Windows.Count > 1:
+                            wb.Windows.Item(wb.Windows.Count).Close()
+                        logger.debug("Reduced workbook windows to 1 after fresh open")
+                    except Exception:
+                        pass
+
+            # If this is our own created Excel instance, keep only the target
+            # workbook so a default blank workbook window is not left behind.
+            self._cleanup_owned_instance_non_target_workbooks(wb)
 
             # Make Excel visible only once, after we have the workbook.
             # This prevents a second Visible=True call (and the resulting window
@@ -2593,15 +2922,7 @@ class ExcelVBAHandler(OfficeVBAHandler):
             # Normalize workbook UI state: when attached via GetObject, some Excel
             # versions return a workbook with a hidden window. Ensure the main window
             # is visible and active so worksheet tabs/sheets are actually shown.
-            try:
-                if wb.Windows.Count > 0:
-                    win = wb.Windows.Item(1)
-                    if not win.Visible:
-                        win.Visible = True
-                    win.Activate()
-                wb.Activate()
-            except Exception:
-                pass
+            self._normalize_workbook_ui(wb)
 
             # Ensure the workbook has the runstate module expected by readiness checks.
             self._ensure_runstate_module_exists(wb)
@@ -2609,6 +2930,16 @@ class ExcelVBAHandler(OfficeVBAHandler):
             # Wait until Workbook_Open and any other startup events have finished
             # before we start manipulating VBProject components.
             self._wait_for_ready()
+
+            # Workbook startup code can still alter visibility; normalize once more
+            # so users always end up with a visible, active workbook UI.
+            self._normalize_workbook_ui(wb)
+
+            # Record when the workbook was fully opened so that _maintain_runtime_ui
+            # can distinguish startup glitches from genuine mid-session issues.
+            import time as _time
+            self._doc_open_time = _time.time()
+
             return wb
         except Exception as e:
             raise VBAError(f"Failed to open workbook: {str(e)}") from e
